@@ -1,0 +1,49 @@
+{
+  "name": "@4fu/pi-task-coordinator",
+  "version": "0.1.2",
+  "description": "Shared background-task notification coordination for @4fu Pi extensions",
+  "license": "MIT",
+  "author": "4fuu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4fuu/pi-task-coordinator.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-extension",
+    "background-tasks",
+    "notifications"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node --import tsx --test tests/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.1 <1",
+    "@earendil-works/pi-tui": ">=0.84.1 <1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-tui": "^0.84.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
