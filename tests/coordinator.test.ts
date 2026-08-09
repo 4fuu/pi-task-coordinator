@@ -37,6 +37,7 @@ interface Harness {
 	widgets: Array<{ owner: TaskSource; key: string; content: unknown }>;
 	ctx: ExtensionContext;
 	start(index: number): void;
+	setIdle(value: boolean): void;
 	dispatch(type: string, event: unknown): Promise<void>;
 	flush(): void;
 	close(): void;
@@ -76,9 +77,11 @@ function harness(
 	const widgets: Harness["widgets"] = [];
 	const extensions: HarnessExtension[] = [];
 	const contexts: ExtensionContext[] = [];
+	let idle = true;
 	const ctx = {
 		hasUI: true,
 		mode: "tui",
+		isIdle: () => idle,
 		ui: {
 			setWidget: () => {},
 		},
@@ -132,6 +135,9 @@ function harness(
 		widgets,
 		ctx,
 		start,
+		setIdle(value) {
+			idle = value;
+		},
 		async dispatch(type, event) {
 			for (const extension of extensions) {
 				for (const handler of extension.handlers.get(type) ?? []) await handler(event, ctx);
@@ -279,6 +285,116 @@ test("task holds prevent the query race without blocking another plugin", () => 
 		state.flush();
 		assert.equal(state.messages.length, 2);
 		assert.deepEqual(state.messages[1]!.message.details.tasks.map((task: TaskNotificationUpdate) => task.source), ["python"]);
+	} finally {
+		state.close();
+	}
+});
+
+test("active turns keep notifications cancellable until tool results have been presented", async () => {
+	const state = harness(["pwsh"]);
+	try {
+		state.setIdle(false);
+		const coordinator = state.extensions[0]!.coordinator;
+		const task = update("pwsh", "wait-race");
+		coordinator.offer(task);
+		state.flush();
+		assert.equal(state.messages.length, 0);
+
+		coordinator.withdrawTask(task.taskKey, ["terminal"], "presented");
+		await state.dispatch("turn_end", { type: "turn_end" });
+		assert.equal(state.messages.length, 0);
+	} finally {
+		state.close();
+	}
+});
+
+test("turn_end delivers an unclaimed active-turn notification before the next model call", async () => {
+	const state = harness(["pwsh"]);
+	try {
+		state.setIdle(false);
+		state.extensions[0]!.coordinator.offer(update("pwsh", "turn-boundary"));
+		state.flush();
+		assert.equal(state.messages.length, 0);
+
+		await state.dispatch("turn_end", { type: "turn_end" });
+		assert.equal(state.messages.length, 1);
+		assert.equal(state.messages[0]!.message.details.tasks[0].taskId, "pw_turn-boundary");
+	} finally {
+		state.close();
+	}
+});
+
+test("agent_settled flushes an active notification when no turn boundary consumes it", async () => {
+	const state = harness(["subagent"]);
+	try {
+		state.setIdle(false);
+		state.extensions[0]!.coordinator.offer(update("subagent", "settled"));
+		state.flush();
+		assert.equal(state.messages.length, 0);
+
+		state.setIdle(true);
+		await state.dispatch("agent_settled", { type: "agent_settled" });
+		assert.equal(state.messages.length, 1);
+		assert.equal(state.messages[0]!.message.details.tasks[0].taskId, "su_settled");
+	} finally {
+		state.close();
+	}
+});
+
+test("agent_settled keeps work pending if an earlier extension starts another run", async () => {
+	const state = harness(["python"]);
+	try {
+		state.setIdle(false);
+		state.extensions[0]!.coordinator.offer(update("python", "settled-order"));
+		state.flush();
+		assert.equal(state.messages.length, 0);
+
+		state.setIdle(true);
+		state.extensions[0]!.handlers.get("agent_settled")!.unshift(() => state.setIdle(false));
+		await state.dispatch("agent_settled", { type: "agent_settled" });
+		assert.equal(state.messages.length, 0);
+
+		await state.dispatch("turn_end", { type: "turn_end" });
+		assert.equal(state.messages.length, 1);
+	} finally {
+		state.close();
+	}
+});
+
+test("a coalescing timer that fires while active recovers at agent_settled", async () => {
+	const state = harness(["python"], undefined, true, { coalesceMs: 5 });
+	try {
+		state.setIdle(false);
+		state.extensions[0]!.coordinator.offer(update("python", "busy-timer"));
+		await new Promise((resolve) => setTimeout(resolve, 15));
+		assert.equal(state.messages.length, 0);
+
+		state.setIdle(true);
+		await state.dispatch("agent_settled", { type: "agent_settled" });
+		assert.equal(state.messages.length, 1);
+	} finally {
+		state.close();
+	}
+});
+
+test("turn boundaries preserve delivery retry backoff", async () => {
+	let attempts = 0;
+	const state = harness(["pwsh"], () => {
+		attempts++;
+		throw new Error("queue unavailable");
+	}, true, { deliveryRetryMs: 20, maxDeliveryAttempts: 2 });
+	try {
+		state.setIdle(false);
+		state.extensions[0]!.coordinator.offer(update("pwsh", "boundary-retry"));
+		await assert.rejects(state.dispatch("turn_end", { type: "turn_end" }), /queue unavailable/);
+		assert.equal(attempts, 1);
+
+		await state.dispatch("turn_end", { type: "turn_end" });
+		assert.equal(attempts, 1);
+
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		await assert.rejects(state.dispatch("turn_end", { type: "turn_end" }), /queue unavailable/);
+		assert.equal(attempts, 2);
 	} finally {
 		state.close();
 	}

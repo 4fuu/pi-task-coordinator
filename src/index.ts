@@ -350,7 +350,11 @@ export class TaskCoordinator {
 		this.maxDeliveryAttempts = Math.max(1, options.maxDeliveryAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS);
 		pi.events.on(TASK_COORDINATOR_CHANNEL, (event) => this.receive(event));
 		pi.on("message_end", (event) => this.onMessageEnd(event));
-		pi.on("agent_settled", () => this.scheduleDeliveryRetry());
+		pi.on("turn_end", () => this.flushAtTurnBoundary());
+		pi.on("agent_settled", () => {
+			this.scheduleDeliveryRetry();
+			this.flushNow();
+		});
 	}
 
 	startSession(ctx: ExtensionContext, sessionId: string): void {
@@ -480,9 +484,14 @@ export class TaskCoordinator {
 	}
 
 	flushNow(): void {
+		this.flush(false);
+	}
+
+	private flush(turnBoundary: boolean): void {
 		if (!this.sessionId || !this.isLeader()) return;
 		if (this.flushTimer) clearTimeout(this.flushTimer);
 		this.flushTimer = undefined;
+		if (!turnBoundary && !this.ctx?.isIdle()) return;
 		const candidates = [...this.pending.values()]
 			.filter(({ update, eligibleAt }) => eligibleAt <= Date.now() && !this.isHeld(update))
 			.sort((a, b) => (a.update.occurredAt ?? a.receivedAt) - (b.update.occurredAt ?? b.receivedAt));
@@ -523,6 +532,10 @@ export class TaskCoordinator {
 		} finally {
 			if (this.pending.size > 0) this.armFlush();
 		}
+	}
+
+	private flushAtTurnBoundary(): void {
+		this.flush(true);
 	}
 
 	private createHold(taskKey: string): () => void {
