@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$repo_root"; export PATH="$HOME/.local/bin:$PATH"
+minimum_node="22.19.0"; pinned_node="22.19.0"; started=$SECONDS
+log() { printf '[%s] [pi-task-coordinator setup] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+version_at_least() { local version=${1#v} IFS=.; local -a have required; read -r -a have <<< "$version"; read -r -a required <<< "$minimum_node"; [[ ${have[0]:-0} =~ ^[0-9]+$ && ${have[1]:-0} =~ ^[0-9]+$ && ${have[2]:-0} =~ ^[0-9]+$ ]] || return 1; ((10#${have[0]:-0}>10#${required[0]})) || ((10#${have[0]:-0}==10#${required[0]} && 10#${have[1]:-0}>10#${required[1]})) || ((10#${have[0]:-0}==10#${required[0]} && 10#${have[1]:-0}==10#${required[1]} && 10#${have[2]:-0}>=10#${required[2]})); }
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && version_at_least "$(node --version)"; then log "Using existing Node $(node --version) and npm $(npm --version)."; else
+  log "Preparing pinned Node.js installation."; missing_packages=(); command -v curl >/dev/null 2>&1 || missing_packages+=(curl); command -v xz >/dev/null 2>&1 || missing_packages+=(xz-utils); dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'ok installed' || missing_packages+=(ca-certificates)
+  if ((${#missing_packages[@]})); then if ((EUID==0)); then apt=(env DEBIAN_FRONTEND=noninteractive apt-get); elif command -v sudo >/dev/null 2>&1; then apt=(sudo env DEBIAN_FRONTEND=noninteractive apt-get); else printf 'Cannot install prerequisites (%s): run as root or install sudo.\n' "${missing_packages[*]}" >&2; exit 1; fi; "${apt[@]}" update; "${apt[@]}" install -y "${missing_packages[@]}"; fi
+  case "$(uname -m)" in x86_64|amd64) node_arch=x64;; aarch64|arm64) node_arch=arm64;; *) printf 'Unsupported architecture for Node.js: %s\n' "$(uname -m)" >&2; exit 1;; esac
+  install_root="$HOME/.local/share/node-v${pinned_node}-linux-${node_arch}"; if [[ ! -x "$install_root/bin/node" ]]; then archive="$(mktemp "${TMPDIR:-/tmp}/node.XXXXXX.tar.xz")"; trap 'rm -f "${archive:-}"' EXIT; curl --fail --location --retry 3 --output "$archive" "https://nodejs.org/dist/v${pinned_node}/node-v${pinned_node}-linux-${node_arch}.tar.xz"; mkdir -p "$HOME/.local/share"; tar -xJf "$archive" -C "$HOME/.local/share"; rm -f "$archive"; trap - EXIT; fi
+  mkdir -p "$HOME/.local/bin"; for tool in node npm npx corepack; do ln -sfn "$install_root/bin/$tool" "$HOME/.local/bin/$tool"; done; hash -r; log "Installed Node $(node --version) and npm $(npm --version)."
+fi
+log "Ensuring repository-scoped login PATH marker."; profile="$HOME/.bash_profile"; touch "$profile"; begin='# >>> pi-task-coordinator orb PATH >>>'; end='# <<< pi-task-coordinator orb PATH <<<'
+if ! grep -Fqx "$begin" "$profile"; then printf '\n%s\nrepo_root=%q\ncase "$PWD" in "$repo_root"|"$repo_root"/*) export PATH="$HOME/.local/bin:$PATH" ;; esac\n%s\n' "$begin" "$repo_root" "$end" >> "$profile"; fi
+log "Installing locked npm dependencies."; npm ci --no-audit --no-fund; log "Complete in $((SECONDS - started)) seconds."
