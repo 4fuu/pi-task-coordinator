@@ -9,7 +9,6 @@ import { Text } from "@earendil-works/pi-tui";
 export const TASK_COORDINATOR_PROTOCOL = 1 as const;
 export const TASK_COORDINATOR_CHANNEL = "@4fu/pi-task-coordinator/v1";
 export const TASK_NOTIFICATION_TYPE = "pi-background-task-notification";
-export const TASK_WIDGET_KEY = "pi-background-tasks";
 
 const DEFAULT_COALESCE_MS = 600;
 const DEFAULT_HEARTBEAT_MS = 1_000;
@@ -20,7 +19,6 @@ const MAX_EVENTS_PER_MESSAGE = 10;
 const MAX_MODEL_CONTENT_CHARS = 16_000;
 const MAX_OUTPUT_CHARS = 12_000;
 const MAX_SUMMARY_CHARS = 2_000;
-const MAX_WIDGET_TASKS = 5;
 
 export type TaskSource = "python" | "pwsh" | "subagent";
 export type TaskNotificationKind = "ready" | "terminal";
@@ -52,16 +50,6 @@ export interface TaskNotificationUpdate {
 	occurredAt?: number;
 }
 
-export interface ActiveTaskUpdate {
-	taskKey: string;
-	source: TaskSource;
-	taskId: string;
-	status: string;
-	startedAt: number;
-	summary?: string;
-	meta?: string;
-}
-
 export interface TaskNotificationCallbacks {
 	onSubmitted?(deliveryId: string): void | Promise<void>;
 	onDelivered?(deliveryId: string): void | Promise<void>;
@@ -91,13 +79,6 @@ interface PendingRecord {
 
 interface InflightRecord extends PendingRecord {
 	deliveryId: string;
-}
-
-interface ActiveSnapshot {
-	participantId: string;
-	source: TaskSource;
-	seenAt: number;
-	tasks: ActiveTaskUpdate[];
 }
 
 interface HoldRecord {
@@ -139,7 +120,6 @@ type CoordinatorEvent =
 	| { protocol: 1; type: "withdraw"; sessionId: string; taskKey: string; events: TaskNotificationKind[]; reason: TaskWithdrawalReason }
 	| { protocol: 1; type: "hold"; sessionId: string; participantId: string; source: TaskSource; taskKey: string; token: string }
 	| { protocol: 1; type: "release"; sessionId: string; token: string }
-	| { protocol: 1; type: "snapshot"; sessionId: string; participantId: string; source: TaskSource; tasks: ActiveTaskUpdate[]; at: number }
 	| { protocol: 1; type: "prepare"; sessionId: string; deliveryId: string; eventIds: string[] }
 	| { protocol: 1; type: "accepted"; sessionId: string; deliveryId: string; eventIds: string[] }
 	| { protocol: 1; type: "rollback"; sessionId: string; deliveryId: string; eventIds: string[] }
@@ -182,27 +162,6 @@ function normalizeUpdate(value: unknown): TaskNotificationUpdate | undefined {
 	};
 }
 
-function normalizeActiveTask(value: unknown, source: TaskSource): ActiveTaskUpdate | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const input = value as Record<string, unknown>;
-	if (
-		input.source !== source ||
-		typeof input.taskKey !== "string" || input.taskKey.length === 0 || input.taskKey.length > 256 ||
-		typeof input.taskId !== "string" || input.taskId.length === 0 || input.taskId.length > 128 ||
-		typeof input.status !== "string" || input.status.length === 0 || input.status.length > 64 ||
-		typeof input.startedAt !== "number" || !Number.isFinite(input.startedAt)
-	) return undefined;
-	return {
-		taskKey: input.taskKey,
-		source,
-		taskId: input.taskId,
-		status: input.status,
-		startedAt: input.startedAt,
-		summary: boundedText(input.summary, 500),
-		meta: boundedText(input.meta, 200),
-	};
-}
-
 function normalizeEvent(value: unknown): CoordinatorEvent | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const input = value as Record<string, unknown>;
@@ -235,14 +194,6 @@ function normalizeEvent(value: unknown): CoordinatorEvent | undefined {
 			return { ...base, type: "hold", participantId: input.participantId, source: input.source, taskKey: input.taskKey, token: input.token };
 		case "release":
 			return typeof input.token === "string" ? { ...base, type: "release", token: input.token } : undefined;
-		case "snapshot": {
-			if (typeof input.participantId !== "string" || !isSource(input.source) || !Array.isArray(input.tasks) || typeof input.at !== "number") return undefined;
-			const tasks = input.tasks.slice(0, 100).flatMap((task) => {
-				const normalized = normalizeActiveTask(task, input.source as TaskSource);
-				return normalized ? [normalized] : [];
-			});
-			return { ...base, type: "snapshot", participantId: input.participantId, source: input.source, tasks, at: input.at };
-		}
 		case "prepare":
 		case "accepted":
 		case "rollback":
@@ -328,16 +279,12 @@ export class TaskCoordinator {
 	private readonly inflight = new Map<string, InflightRecord>();
 	private readonly holds = new Map<string, HoldRecord>();
 	private readonly localHolds = new Map<string, HoldRecord>();
-	private readonly snapshots = new Map<string, ActiveSnapshot>();
 	private readonly localOffers = new Map<string, LocalOffer>();
-	private localSnapshot?: ActiveTaskUpdate[];
 	private sessionId?: string;
 	private ctx?: ExtensionContext;
 	private heartbeatTimer?: NodeJS.Timeout;
 	private flushTimer?: NodeJS.Timeout;
 	private deliveryRetryTimer?: NodeJS.Timeout;
-	private widgetSignature?: string;
-	private widgetVisible = false;
 
 	constructor(pi: ExtensionAPI, source: TaskSource, options: TaskCoordinatorOptions = {}) {
 		this.pi = pi;
@@ -366,12 +313,10 @@ export class TaskCoordinator {
 		this.inflight.clear();
 		this.holds.clear();
 		this.localHolds.clear();
-		this.snapshots.clear();
 		for (const local of this.localOffers.values()) {
 			if (local.transitionTimer) clearTimeout(local.transitionTimer);
 		}
 		this.localOffers.clear();
-		this.localSnapshot = undefined;
 		this.announce();
 		this.emit({ protocol: TASK_COORDINATOR_PROTOCOL, type: "probe", sessionId });
 		if (this.heartbeatMs > 0) {
@@ -379,7 +324,6 @@ export class TaskCoordinator {
 				this.announce();
 				this.replayLocalState();
 				this.prune();
-				this.updateWidget();
 				if (this.isLeader() && this.pending.size > 0) this.armFlush();
 			}, this.heartbeatMs);
 			this.heartbeatTimer.unref?.();
@@ -399,9 +343,6 @@ export class TaskCoordinator {
 		this.heartbeatTimer = undefined;
 		this.flushTimer = undefined;
 		this.deliveryRetryTimer = undefined;
-		if (this.widgetVisible && this.ctx?.hasUI) this.ctx.ui.setWidget(TASK_WIDGET_KEY, undefined, { placement: "belowEditor" });
-		this.widgetVisible = false;
-		this.widgetSignature = undefined;
 		this.sessionId = undefined;
 		this.ctx = undefined;
 		this.participants.clear();
@@ -409,12 +350,10 @@ export class TaskCoordinator {
 		this.inflight.clear();
 		this.holds.clear();
 		this.localHolds.clear();
-		this.snapshots.clear();
 		for (const local of this.localOffers.values()) {
 			if (local.transitionTimer) clearTimeout(local.transitionTimer);
 		}
 		this.localOffers.clear();
-		this.localSnapshot = undefined;
 	}
 
 	offer(update: TaskNotificationUpdate, callbacks: TaskNotificationCallbacks = {}): void {
@@ -463,24 +402,6 @@ export class TaskCoordinator {
 
 	holdSource(): () => void {
 		return this.createHold(`${this.source}:*`);
-	}
-
-	updateActiveTasks(tasks: ActiveTaskUpdate[]): void {
-		if (!this.sessionId) return;
-		const normalized = tasks.slice(0, 100).flatMap((task) => {
-			const value = normalizeActiveTask(task, this.source);
-			return value ? [value] : [];
-		});
-		this.localSnapshot = normalized;
-		this.emit({
-			protocol: TASK_COORDINATOR_PROTOCOL,
-			type: "snapshot",
-			sessionId: this.sessionId,
-			participantId: this.participantId,
-			source: this.source,
-			tasks: normalized,
-			at: Date.now(),
-		});
 	}
 
 	flushNow(): void {
@@ -570,7 +491,6 @@ export class TaskCoordinator {
 		switch (event.type) {
 			case "participant":
 				this.participants.set(event.participantId, { participantId: event.participantId, source: event.source, seenAt: event.at });
-				this.updateWidget();
 				break;
 			case "probe":
 				this.announce();
@@ -578,7 +498,6 @@ export class TaskCoordinator {
 				break;
 			case "leave":
 				this.removeParticipant(event.participantId);
-				this.updateWidget();
 				break;
 			case "offer":
 				if (!this.inflight.has(event.update.eventId)) {
@@ -612,15 +531,6 @@ export class TaskCoordinator {
 			case "release":
 				this.holds.delete(event.token);
 				this.armFlush();
-				break;
-			case "snapshot":
-				this.snapshots.set(event.participantId, {
-					participantId: event.participantId,
-					source: event.source,
-					seenAt: event.at,
-					tasks: event.tasks,
-				});
-				this.updateWidget();
 				break;
 			case "prepare":
 				for (const eventId of event.eventIds) {
@@ -718,7 +628,6 @@ export class TaskCoordinator {
 
 	private removeParticipant(participantId: string): void {
 		this.participants.delete(participantId);
-		this.snapshots.delete(participantId);
 		for (const [token, hold] of this.holds) {
 			if (hold.participantId === participantId) this.holds.delete(token);
 		}
@@ -766,15 +675,6 @@ export class TaskCoordinator {
 		for (const hold of this.localHolds.values()) {
 			this.emit({ protocol: TASK_COORDINATOR_PROTOCOL, type: "hold", sessionId: this.sessionId, ...hold });
 		}
-		if (this.localSnapshot) this.emit({
-			protocol: TASK_COORDINATOR_PROTOCOL,
-			type: "snapshot",
-			sessionId: this.sessionId,
-			participantId: this.participantId,
-			source: this.source,
-			tasks: this.localSnapshot,
-			at: Date.now(),
-		});
 		for (const local of this.localOffers.values()) {
 			if (local.state !== "pending" && local.state !== "submitted") continue;
 			this.emit({ protocol: TASK_COORDINATOR_PROTOCOL, type: "offer", sessionId: this.sessionId, update: local.update, at: Date.now() });
@@ -875,48 +775,6 @@ export class TaskCoordinator {
 		});
 	}
 
-	private updateWidget(): void {
-		const ctx = this.ctx;
-		if (!ctx?.hasUI) return;
-		if (!this.isLeader()) {
-			if (this.widgetVisible) ctx.ui.setWidget(TASK_WIDGET_KEY, undefined, { placement: "belowEditor" });
-			this.widgetVisible = false;
-			this.widgetSignature = undefined;
-			return;
-		}
-		const tasks = [...this.snapshots.values()]
-			.filter((snapshot) => this.participants.has(snapshot.participantId))
-			.flatMap((snapshot) => snapshot.tasks)
-			.sort((a, b) => a.startedAt - b.startedAt);
-		const now = Date.now();
-		const rows = tasks.slice(0, MAX_WIDGET_TASKS).map((task) => {
-			const meta = task.meta ? ` · ${oneLine(task.meta, 40)}` : "";
-			const summary = task.summary ? ` · ${oneLine(task.summary, 70)}` : "";
-			return `${task.source} ${task.taskId} · ${task.status}${meta} · ${duration(now - task.startedAt)}${summary}`;
-		});
-		if (tasks.length > rows.length) rows.push(`+${tasks.length - rows.length} more`);
-		const signature = rows.join("\n");
-		if (signature === this.widgetSignature) return;
-		this.widgetSignature = signature;
-		if (rows.length === 0) {
-			ctx.ui.setWidget(TASK_WIDGET_KEY, undefined, { placement: "belowEditor" });
-			this.widgetVisible = false;
-			return;
-		}
-		this.widgetVisible = true;
-		if (ctx.mode !== "tui") {
-			ctx.ui.setWidget(TASK_WIDGET_KEY, ["Background Tasks", ...rows], { placement: "belowEditor" });
-			return;
-		}
-		ctx.ui.setWidget(
-			TASK_WIDGET_KEY,
-			(_tui, theme) => new Text([
-				theme.fg("accent", theme.bold("Background Tasks")),
-				...rows.map((row) => theme.fg("dim", row)),
-			].join("\n"), 0, 0),
-			{ placement: "belowEditor" },
-		);
-	}
 }
 
 export function registerTaskCoordinator(

@@ -1,10 +1,12 @@
 # pi-task-coordinator
 
-Shared, low-noise background-task notifications for the `@4fu` Pi extensions.
+Shared, low-noise background-task notification aggregation and delivery for the `@4fu` Pi extensions.
 
-This is an internal runtime library rather than a Pi extension. `pi-python`, `pi-pwsh`, and `pi-subagent` install it transitively and cooperate through Pi's extension event bus. Any one plugin works by itself; any installed combination elects one notification coordinator, batches task updates, and renders one active-task widget.
+This is an internal runtime library rather than a Pi extension. `pi-python`, `pi-pwsh`, and `pi-subagent` install it transitively and cooperate through Pi's extension event bus. Any one plugin works by itself; any installed combination elects one notification coordinator and batches task updates for delivery.
 
-Task execution and durable state remain owned by the originating plugin. The coordinator only handles short-lived aggregation, presentation withdrawal, leader election, and shared TUI rendering.
+Task execution and durable state remain owned by the originating plugin. This package owns notification aggregation and delivery only, including presentation withdrawal and leader election. The shared task TUI and `/tasks` command live in `@4fu/pi-tasks`.
+
+Task plugins should be upgraded together for this presentation split.
 
 ## Requirements
 

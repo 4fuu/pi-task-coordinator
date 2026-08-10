@@ -34,7 +34,7 @@ interface HarnessExtension {
 interface Harness {
 	extensions: HarnessExtension[];
 	messages: Array<{ owner: TaskSource; message: any; options: any }>;
-	widgets: Array<{ owner: TaskSource; key: string; content: unknown }>;
+	widgetCalls: number;
 	ctx: ExtensionContext;
 	start(index: number): void;
 	setIdle(value: boolean): void;
@@ -74,7 +74,7 @@ function harness(
 ): Harness {
 	const bus = new Bus();
 	const messages: Harness["messages"] = [];
-	const widgets: Harness["widgets"] = [];
+	let widgetCalls = 0;
 	const extensions: HarnessExtension[] = [];
 	const contexts: ExtensionContext[] = [];
 	let idle = true;
@@ -122,7 +122,7 @@ function harness(
 		contexts.push({
 			...ctx,
 			ui: {
-				setWidget: (key: string, content: unknown) => widgets.push({ owner: source, key, content }),
+				setWidget: () => { widgetCalls++; },
 			},
 		} as unknown as ExtensionContext);
 	}
@@ -132,7 +132,7 @@ function harness(
 	return {
 		extensions,
 		messages,
-		widgets,
+		get widgetCalls() { return widgetCalls; },
 		ctx,
 		start,
 		setIdle(value) {
@@ -222,7 +222,7 @@ test("withdrawing every viewed result produces no notification", () => {
 	}
 });
 
-test("a late higher-priority participant recovers offers, holds, and widget state through probe replay", () => {
+test("a late higher-priority participant recovers offers and holds through probe replay without setting a widget", () => {
 	const state = harness(["pwsh", "python"], undefined, false);
 	try {
 		state.start(0);
@@ -230,18 +230,10 @@ test("a late higher-priority participant recovers offers, holds, and widget stat
 		const task = update("pwsh", "early");
 		const release = pwsh.holdTask(task.taskKey);
 		pwsh.offer(task);
-		pwsh.updateActiveTasks([{
-			taskKey: task.taskKey,
-			source: "pwsh",
-			taskId: task.taskId,
-			status: "running",
-			startedAt: Date.now() - 1_000,
-			summary: "early task",
-		}]);
 		state.start(1);
 		state.flush();
 		assert.equal(state.messages.length, 0);
-		assert.ok(state.widgets.some((widget) => widget.owner === "python" && widget.content !== undefined));
+		assert.equal(state.widgetCalls, 0);
 		release();
 		state.flush();
 		assert.equal(state.messages.length, 1);
