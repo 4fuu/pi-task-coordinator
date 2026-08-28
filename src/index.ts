@@ -317,11 +317,11 @@ export class TaskCoordinator {
 			if (local.transitionTimer) clearTimeout(local.transitionTimer);
 		}
 		this.localOffers.clear();
-		this.announce();
-		this.emit({ protocol: TASK_COORDINATOR_PROTOCOL, type: "probe", sessionId });
+		if (!this.announce()) return;
+		if (!this.emit({ protocol: TASK_COORDINATOR_PROTOCOL, type: "probe", sessionId })) return;
 		if (this.heartbeatMs > 0) {
 			this.heartbeatTimer = setInterval(() => {
-				this.announce();
+				if (!this.announce()) return;
 				this.replayLocalState();
 				this.prune();
 				if (this.isLeader() && this.pending.size > 0) this.armFlush();
@@ -331,12 +331,17 @@ export class TaskCoordinator {
 	}
 
 	closeSession(): void {
-		if (this.sessionId) this.emit({
+		const sessionId = this.sessionId;
+		this.clearSession();
+		if (sessionId) this.emit({
 			protocol: TASK_COORDINATOR_PROTOCOL,
 			type: "leave",
-			sessionId: this.sessionId,
+			sessionId,
 			participantId: this.participantId,
 		});
+	}
+
+	private clearSession(): void {
 		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
 		if (this.flushTimer) clearTimeout(this.flushTimer);
 		if (this.deliveryRetryTimer) clearTimeout(this.deliveryRetryTimer);
@@ -610,9 +615,9 @@ export class TaskCoordinator {
 		});
 	}
 
-	private announce(): void {
-		if (!this.sessionId) return;
-		this.emit({
+	private announce(): boolean {
+		if (!this.sessionId) return false;
+		return this.emit({
 			protocol: TASK_COORDINATOR_PROTOCOL,
 			type: "participant",
 			sessionId: this.sessionId,
@@ -622,8 +627,14 @@ export class TaskCoordinator {
 		});
 	}
 
-	private emit(event: CoordinatorEvent): void {
-		this.pi.events.emit(TASK_COORDINATOR_CHANNEL, event);
+	private emit(event: CoordinatorEvent): boolean {
+		try {
+			this.pi.events.emit(TASK_COORDINATOR_CHANNEL, event);
+			return true;
+		} catch {
+			this.clearSession();
+			return false;
+		}
 	}
 
 	private removeParticipant(participantId: string): void {
