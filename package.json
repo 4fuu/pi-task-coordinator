@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-task-coordinator",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Shared background-task notification coordination for @4fu Pi extensions",
   "license": "MIT",
   "author": "4fuu",
