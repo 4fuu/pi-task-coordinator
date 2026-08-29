@@ -152,6 +152,32 @@ function harness(
 	};
 }
 
+test("a stale heartbeat stops after the first failed bus emission", async () => {
+	let stale = false;
+	let attempts = 0;
+	const pi = {
+		events: {
+			emit: () => {
+				attempts++;
+				if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+			},
+			on: () => () => {},
+		},
+		on: () => {},
+		registerMessageRenderer: () => {},
+		sendMessage: () => {},
+	} as unknown as ExtensionAPI;
+	const coordinator = registerTaskCoordinator(pi, "python", { heartbeatMs: 5 });
+	coordinator.startSession({ isIdle: () => true } as ExtensionContext, "session-one");
+	assert.equal(attempts, 2);
+
+	stale = true;
+	await waitUntil(() => attempts === 3);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(attempts, 3);
+	coordinator.closeSession();
+});
+
 const combinations: TaskSource[][] = [
 	["python"],
 	["pwsh"],
